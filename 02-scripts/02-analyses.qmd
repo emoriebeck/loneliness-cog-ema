@@ -1,0 +1,386 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+# Summary
+
+RQ1A: 
+
+$$
+Y_{it} = \gamma_{00} + \gamma_{01}*lonely\_rmssd_{i} + u_{0i} + e_{it}\\
+e_{it}^2 = exp(\eta_{00} + \eta_{01}*lonely\_rmssd_{i}  + u_{1i})
+$$
+
+RQ1B-D: 
+
+$$
+Y_{it} = \gamma_{00} + \gamma_{01}*lonely\_rmssd_{i} + \gamma_{02}*moderator\_GMC_{i} + \gamma_{03}*lonely\_mssd_{i}*moderator\_GMC_{i} + u_{0i} + e_{it}\\
+e_{it}^2 = exp(\eta_{00} + \eta_{01}*lonely\_rmssd_{i} + \eta_{02}*moderator\_GMC_{i} + \eta_{03}*lonely\_mssd_{i}*moderator\_GMC_{i} + u_{1i})
+$$
+
+RQ2A: 
+
+$$
+Y_{it} = \gamma_{00} + u_{0i} + (\gamma_{10} + u_{1i}) * lonely\_WPC_{it} + e_{it}\\
+e_{it}^2 = exp(\eta_{00} + u_{2i} + (\eta_{10}+ u_{2i})*lonely\_WPC_{it})
+$$
+
+RQ2B: 
+
+$$
+Y_{it} = \gamma_{00} + \gamma_{01} * moderator\_GMC + u_{0i} + (\gamma_{10} + \gamma_{11} * moderator\_GMC  + u_{1i}) * lonely\_WPC_{it} + e_{it}\\
+e_{it}^2 = exp(\eta_{00} + \eta_{01} * moderator\_GMC + u_{2i} + (\eta_{10} + \eta_{11} * moderator\_GMC  + u_{3i}) * lonely\_WPC_{it})\\
+$$
+
+RQ2C-D: 
+
+$$
+Y_{it} = \gamma_{00} + u_{0i} + \gamma_{10} * lonely\_WPC_{it} + u_{1i} + \gamma_{20} * moderator\_WPC_{it} + u_{2i} + \gamma_{30} * lonely\_WPC_{it}*moderator\_WPC_{it} + u_{3i} + e_{it}\\
+e_{it}^2 = exp(\eta_{00} + u_{4i} + \eta_{10} * lonely\_WPC_{it} + u_{5i} + \eta_{20} * moderator\_WPC_{it} + u_{6i} + \eta_{30} * lonely\_WPC_{it}*moderator\_WPC_{it} + u_{7i})
+
+$$
+
+# Unconditional Models 
+
+First, we'll run unconditional models in order to estimate the amount of between-person differences in within-person location and scale variability. 
+
+```{r, eval = F}
+d <- (nested_models %>% filter(RQ == "RQ2" & moder == "none"))$data[[3]]
+m0_cogsc <- brm(
+    , formula = bf(cog_value ~ 1 + (1 | SID),
+                   sigma ~ 1 + (1 | SID))
+    , data = d
+    # , family = "gaussian"
+    , cores = 12
+    , threads = threading(3)
+    , backend = "cmdstanr"
+    , chains = 4
+    , warmup = 2000
+    , iter = 5000
+    , prior = c(
+        prior(exponential(1), class = sd),
+        prior(normal(0, .5), class = Intercept, dpar = sigma),
+        prior(exponential(1), class = sd, dpar = sigma)
+        )
+    , init = 0
+  )
+
+
+d <- (nested_models %>% filter(RQ == "RQ2" & moder == "none"))$data[[9]]
+m0_cogrt <- brm(
+    , formula = bf(cog_value ~ 1 + (1 | SID),
+                   sigma ~ 1 + (1 | SID))
+    , data = d
+    # , family = "exgaussian"
+    , cores = 12
+    , threads = threading(3)
+    , backend = "cmdstanr"
+    , chains = 4
+    , warmup = 2000
+    , iter = 5000
+    , prior = c(
+        prior(exponential(1), class = sd),
+        prior(normal(0, .5), class = Intercept, dpar = sigma),
+        prior(exponential(1), class = sd, dpar = sigma)
+        )
+    , init = 0
+  )
+
+rq1_dist_fun <- function(rf, category, outcome){
+  subttl <- str_wrap(unique(str_remove_all(rf$comb, "Momentary ")), 27)
+  out <- mapvalues(outcome, var_labs$var, var_labs$label, warn_missing = F)
+  ttl <- category
+  lims <- if(category == "Location") c(0, 100) else c(1, 15.3)
+  brks <- if(category == "Location") seq(0, 100, 10) else seq(1, 15, 3)
+  rf %>%
+      ggplot(aes(x = Estimate)) + 
+        # geom_histogram(fill = colr, alpha = .75, color = "black") + 
+        geom_density(fill = "goldenrod3", alpha = .6) +
+        my_theme() + 
+        labs(
+          , y = "Density"
+          , title = ttl
+          , x = if(category == "Location") out else str_wrap(paste("Within-Person Variability in", out), 30)
+          ) + 
+        scale_x_continuous(limits = lims, breaks = brks) +
+        theme(legend.position = "none")
+}
+
+m0_dist <- rx_fun(m0_cogsc) %>% 
+  mutate(outcome = "cog_comp") %>%
+  full_join(
+    rx_fun(m0_cogrt) %>% 
+      # mutate_at(vars(Estimate, lower, upper), exp) %>%
+      mutate(outcome = "cog_medianRTc")
+  ) %>%
+  mutate(category = ifelse(grepl("sigma", term), "Scale", "Location")) %>%
+  group_by(outcome, category) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(p = pmap(list(data, category, outcome), rq1_dist_fun))
+p2 <- wrap_plots(
+    m0_dist$p
+    , ncol = 2
+    ) + 
+    plot_annotation(
+      title = "Individual Differences in Cognitive Function and Variability"
+      , theme = my_theme()
+      )
+p2
+ggsave(file = "03-results/03-plots/fig-3-cog-var.png", width = 8, height = 5)
+VarCorr(m0_cogsc)
+ICC(m0_cogrt)
+```
+
+# Models 
+## Function 
+
+First, we'll set up a models function to to estimate all main and exploratory / robustness test models, extract effect sizes, and generate predictions. This will draw on the functions for effect sizes and predictions from the home page. 
+
+```{r}
+mod_fun <- function(d, rq, outcome, outtime, moder, cov){
+  # set up formula
+  fe <- if(grepl("1", rq)) "lonely_mssd" else "lonely_wpc"
+  re <- if(grepl("1", rq)) "1" else "lonely_wpc"
+  covs <- if(cov == "none") c("beep_wpc", "dec_time_c", "interrupt") else c("age_c", "income_log_gmc", "edu_years_gmc", "relstat_single_gmc", "relstat_sep_gmc", "beep_wpc", "dec_time_c", "interrupt") # always adjust for cog EMA vars
+  covs <- covs[!covs %in% moder]
+  if(cov == "dep") covs <- c(covs, "dep_gmc")
+  # moderators
+  if(moder != "none") fe <- paste0(c(fe, "mod_value_c"), collapse = "*") 
+  if(moder %in% c("ss_quant_wpc", "ss_qual_wpc") & grepl("2", rq)){ # level 1 moderators
+      re <- paste0(c(re, "mod_value_c"), collapse = " * ")
+    }
+  if(cov == "all"){
+    fe_loc <- fe_sca <- c(fe, covs)                        # L2 covs
+  } else { 
+    fe_loc <- c(fe, covs)                                  # L2 covs
+    fe_sca <- fe                                           # L2 scale covs
+  } 
+  re <- paste0(re, collapse = " + ")                       # random effects 
+  fe_loc <-  paste0(c(fe_loc), collapse = " + ")           # fixed effects 
+  fe_sca <-  paste0(c(fe_sca), collapse = " + ")           # fixed effects 
+  f1 <- sprintf("cog_value ~ %s + (%s | SID)", fe_loc, re) # location
+  f2 <- sprintf("sigma ~ %s + (%s | SID)", fe_sca, re)     # scale
+  frm <- bf(f1, f2)                                        # combine
+  
+  # set up link function 
+  # lnk <- if(grepl("medianRT", outcome)) "gaussian" else if(outcome %in% c("cog_comp", "dsm_score")) "gaussian" else "lognormal"
+  lnk <- "gaussian"
+  
+  Prior = c(
+      prior(normal(0, .5), class = b),                        # Prior for location FEs
+      prior(exponential(1), class = sd),                      # Prior for location SDs
+      prior(normal(0, .5), class = Intercept, dpar = sigma),  # Prior for scale intercept
+      prior(exponential(1), class = sd, dpar = sigma),        # Prior for scale SDs
+      prior(normal(0, .25), class = b, dpar = sigma)          # Prior for scale FEs
+      )
+  if(re != "1") Prior <- c(Prior, prior(lkj(1), class = cor)) # Prior for correlations
+  itr <- if(rq == "RQ1") 10000 else 17000                     # num total iterations
+  wrmp <- if(rq == "RQ1") 3000 else 5000                      # num warmup iterations
+  m <- brm(                    
+    , formula = frm           # formula
+    , data = d                # data 
+    , family = lnk            # link
+    , cores = 12              # number of cores
+    , threads = threading(3)  # number of threads / chain
+    , backend = "cmdstanr"    # backend for threading
+    , chains = 4              # number of chains
+    , warmup = wrmp           # num warmup iterations
+    , iter = itr              # num total iterations 
+    , seed = 5                # set seed for reproducibility
+    , prior = Prior           # set priors
+    , init = 0                # set initial values
+  )
+  save(m, file = sprintf("03-results/%s/models/%s-%s-%s-%s.RData", rq, outcome, outtime, moder, cov))
+  
+  fx <- fx_fun(m) 
+  rx <- rx_fun(m)
+  save(fx, rx, file = sprintf("03-results/%s/summary/%s-%s-%s-%s.RData", rq, outcome, outtime, moder, cov))
+  
+  # set up predictions
+  if(moder != "none"){
+    pred <- if(grepl("1", rq)) "lonely_mssd" else "lonely_wpc"
+    fx_pred <- pred_fx_fun(m, pred, moder, cov)
+    rx_pred <- pred_rx_fun(m, pred, moder, cov, rq)
+    save(fx_pred, rx_pred, file = sprintf("03-results/%s/predicted/%s-%s-%s-%s.RData", rq, outcome, outtime, moder, cov))
+  }
+  return(T)
+}
+```
+
+## Run Models 
+
+Next, we can run the models, mapping across all possible combinations we set up on the data cleaning page. 
+
+```{r}
+nested_models %>%
+  mutate(m = pmap(list(data, RQ, outcome, outcome_time, moder, cov), mod_fun))
+```
+
+## Follow-up tests 
+### RQ1 Focal 
+
+For credible effects, we conduct follow-up tests to help us contextualize the effect sizes.  
+
+```{r}
+# Cog scores, main effect of loneliness instability, location adjusted
+load("~/Library/CloudStorage/GoogleDrive-edbeck@ucdavis.edu/.shortcut-targets-by-id/1ISycEVlZDw8eodaQ_NwVMagq49ATG-Yz/Waves of Loneliness/03-results/RQ1/models/cog_comp-contemp-none-location.RData")
+
+m$data %>% 
+  select(SID, lonely_mssd) %>%
+  distinct() %>%
+  summarize(mean = mean(lonely_mssd), sd = sd(lonely_mssd), lower = mean - 2*sd, upper = mean + 2*sd, min = min(lonely_mssd), , max = max(lonely_mssd))
+
+hyp <- c(
+  "Scale: -20% x 2SD"   = "exp(b_sigma_Intercept + -2*b_sigma_lonely_mssd)* 2 = 0"
+  , "Scale: M x 2SD"    = "exp(b_sigma_Intercept + 0*b_sigma_lonely_mssd)*2 = 0"
+  , "Scale: + 20 x 2SD" = "exp(b_sigma_Intercept + 2*b_sigma_lonely_mssd)* 2 = 0"
+)
+test <- hypothesis(m, hyp, class = NULL)
+test$hypothesis
+```
+
+### RQ1 Domains 
+```{r}
+# DSM scores, loneliness instability x social interaction quantity interaction, location adjusted
+load("~/Library/CloudStorage/GoogleDrive-edbeck@ucdavis.edu/.shortcut-targets-by-id/1ISycEVlZDw8eodaQ_NwVMagq49ATG-Yz/Waves of Loneliness/03-results/RQ1/models/dsm_score-contemp-ss_quant_gmc-location.RData")
+
+m$data %>% 
+  select(SID, mod_value_c) %>%
+  distinct() %>%
+  summarize(mean = mean(mod_value_c), sd = sd(mod_value_c), lower = mean - 2*sd, upper = mean + 2*sd)
+
+hyp <- c(
+  "Scale: -20%"   = "b_sigma_lonely_mssd + -2*b_sigma_lonely_mssd:mod_value_c = 0"
+  , "Scale: +20%" = "b_sigma_lonely_mssd + 2*b_sigma_lonely_mssd:mod_value_c = 0"
+)
+test <- hypothesis(m, hyp, class = NULL)
+test$hypothesis
+```
+
+```{r}
+# nback median RTc, loneliness instability x social interaction quantity interaction, location adjusted
+load("~/Library/CloudStorage/GoogleDrive-edbeck@ucdavis.edu/.shortcut-targets-by-id/1ISycEVlZDw8eodaQ_NwVMagq49ATG-Yz/Waves of Loneliness/03-results/RQ1/models/nback_medianRTc-contemp-ss_quant_gmc-location.RData")
+
+m$data %>% 
+  select(SID, mod_value_c) %>%
+  distinct() %>%
+  summarize(mean = mean(mod_value_c), sd = sd(mod_value_c), lower = mean - 2*sd, upper = mean + 2*sd)
+
+hyp <- c(
+  "Scale: -20%"   = "b_sigma_lonely_mssd + -2*b_sigma_lonely_mssd:mod_value_c = 0"
+  , "Scale: +20%" = "b_sigma_lonely_mssd + 2*b_sigma_lonely_mssd:mod_value_c = 0"
+)
+test <- hypothesis(m, hyp, class = NULL)
+test$hypothesis
+```
+
+```{r}
+# VPA scores, loneliness instability x social interaction quality interaction, location adjusted
+load("~/Library/CloudStorage/GoogleDrive-edbeck@ucdavis.edu/.shortcut-targets-by-id/1ISycEVlZDw8eodaQ_NwVMagq49ATG-Yz/Waves of Loneliness/03-results/RQ1/models/vpa_score-contemp-ss_qual_gmc-location.RData")
+
+m$data %>% 
+  select(SID, mod_value_c) %>%
+  distinct() %>%
+  summarize(mean = mean(mod_value_c), sd = sd(mod_value_c), lower = mean - 2*sd, upper = mean + 2*sd)
+
+hyp <- c(
+  "Scale: -20%"   = "b_sigma_lonely_mssd + -2*b_sigma_lonely_mssd:mod_value_c = 0"
+  , "Scale: +20%" = "b_sigma_lonely_mssd + 2*b_sigma_lonely_mssd:mod_value_c = 0"
+)
+test <- hypothesis(m, hyp, class = NULL)
+test$hypothesis
+```
+
+### RQ2 Focal 
+
+```{r}
+# cog scores, wp loneliness x age interaction, location adjusted
+load("~/Library/CloudStorage/GoogleDrive-edbeck@ucdavis.edu/.shortcut-targets-by-id/1ISycEVlZDw8eodaQ_NwVMagq49ATG-Yz/Waves of Loneliness/03-results/RQ2/models/cog_comp-contemp-age_c-location.RData")
+
+d <- m$data %>% 
+        select(SID, mod_value_c) %>% 
+        distinct() %>%
+        summarize(m = mean(mod_value_c), sd = sd(mod_value_c), lower = m - sd, upper = m + sd)
+
+hyp <- c(
+  "Location: 45" = "lonely_wpc + -1.5*lonely_wpc:mod_value_c = 0",
+  "Location: 60" = "lonely_wpc = 0",
+  "Location: 74" = "lonely_wpc + 1.4*lonely_wpc:mod_value_c = 0"
+  )
+hypothesis(m, hyp)$hypothesis
+```
+
+```{r}
+# cog scores, wp loneliness main effect, location adjusted
+load("~/Library/CloudStorage/GoogleDrive-edbeck@ucdavis.edu/.shortcut-targets-by-id/1ISycEVlZDw8eodaQ_NwVMagq49ATG-Yz/Waves of Loneliness/03-results/RQ2/models/cog_comp-contemp-none-location.RData")
+
+
+hyp <- c(
+## location 
+  "Location: +10%"      = "b_lonely_wpc*10 = 0"
+  , "Scale: +10%"       = "b_sigma_lonely_wpc*10 = 0"
+  , "Scale: -20% x 2SD" = "exp(b_sigma_Intercept + -2*b_sigma_lonely_wpc) * 2 = 0"
+  , "Scale: M x 2SD"    = "exp(b_sigma_Intercept +  0*b_sigma_lonely_wpc) * 2 = 0"
+  , "Scale: +20% x 2SD" = "exp(b_sigma_Intercept +  2*b_sigma_lonely_wpc) * 2 = 0"
+)
+test <- hypothesis(m, hyp, class = NULL)
+test$hypothesis
+```
+
+### RQ2 Domains 
+
+```{r}
+# vpa scores, wp loneliness main effect, location adjusted
+load("~/Library/CloudStorage/GoogleDrive-edbeck@ucdavis.edu/.shortcut-targets-by-id/1ISycEVlZDw8eodaQ_NwVMagq49ATG-Yz/Waves of Loneliness/03-results/RQ2/models/vpa_score-contemp-none-location.RData")
+m
+
+hyp <- c(
+## location 
+  "Location: -2 SD"   = "-1*lonely_wpc = 0"
+  , "Location: M"     = "0*lonely_wpc = 0"
+  , "Location: +1 SD" = "3*lonely_wpc = 0"
+## scale 
+  , "Scale: -2 SD"    = "-1*b_sigma_lonely_wpc = 0"
+  , "Scale: M"        = "0*b_sigma_lonely_wpc = 0"
+  , "Scale: +2 SD"    = "3*b_sigma_lonely_wpc = 0"
+)
+test <- hypothesis(m, hyp, class = NULL)
+test$hypothesis
+```
+
+```{r}
+# contemp VPA scores, wpc loneliness  x social interaction quality interaction, location adjusted
+load("~/Library/CloudStorage/GoogleDrive-edbeck@ucdavis.edu/.shortcut-targets-by-id/1ISycEVlZDw8eodaQ_NwVMagq49ATG-Yz/Waves of Loneliness/03-results/RQ2/models/vpa_score-contemp-ss_qual_wpc-location.RData")
+m
+
+hyp <- c(
+  ## location
+  "Location: -10%" = "b_lonely_wpc + -1*b_lonely_wpc:mod_value_c = 0"
+  , "Location: M" = "b_lonely_wpc = 0"
+  , "Location: +10%" = "b_lonely_wpc + 1*b_lonely_wpc:mod_value_c = 0"
+  ## scale 
+  , "Scale: -10%" = "b_sigma_lonely_wpc + -1*b_sigma_lonely_wpc:mod_value_c = 0"
+  , "Scale: M" = "b_sigma_lonely_wpc = 0"
+  , "Scale: +10%" = "b_sigma_lonely_wpc + 1*b_sigma_lonely_wpc:mod_value_c = 0"
+)
+hypothesis(m, hyp, class = NULL)$hypothesis
+```
+
+```{r}
+# prosp VPA scores, wpc loneliness  x trait loneliness interaction, location adjusted
+load("~/Library/CloudStorage/GoogleDrive-edbeck@ucdavis.edu/.shortcut-targets-by-id/1ISycEVlZDw8eodaQ_NwVMagq49ATG-Yz/Waves of Loneliness/03-results/RQ2/models/vpa_score-prosp-loneliness_gmc-location.RData")
+
+d <- m$data %>% 
+        select(SID, mod_value_c) %>% 
+        distinct() %>%
+        summarize(m = mean(mod_value_c), sd = sd(mod_value_c), lower = m - sd, upper = m + sd)
+
+hyp <- c(
+  "Location: -1 SD" = "lonely_wpc + -2.413779*lonely_wpc:mod_value_c = 0",
+  "Location: 60"    = "lonely_wpc = 0",
+  "Location: +1 SD" = "lonely_wpc + 2.407643*lonely_wpc:mod_value_c = 0"
+  )
+hypothesis(m, hyp)$hypothesis
+```

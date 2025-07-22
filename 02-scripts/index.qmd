@@ -1,0 +1,453 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+# Waves of Loneliness, Ripples of Cognitive Fluctuations {.unnumbered}
+
+```{r}
+options(knitr.kable.NA = '')
+```
+
+
+## Workspace 
+### Packages 
+```{r}
+library(psych)           # data cleaning & reliability
+library(readxl)          # read in excel files
+library(broom.mixed)     # summaries of mixed models
+library(tidybayes)       # posterior tools and plotting bayes
+library(patchwork)       # piecing plots together 
+library(knitr)           # build tables
+library(kableExtra)      # format tables
+library(rstan)           # R interface to stan
+library(brms)            # wrapper for rstan
+library(multilevelTools) # multilevel reliability
+library(cmdstanr)        # backend for multicore threading
+library(ggridges)        # overlapping distribution plots
+library(plyr)            # data cleaning
+library(tidyverse)       # all things tidy
+```
+
+### Codebook 
+
+We have three data structures that will help us to document data and wrangle their variable labels at different steps, including a codebook for EMA and baseline variables and a smaller data frame that will match data frame names with longer form names. 
+
+```{r}
+ema_cb   <- read_excel(path = "01-codebook.xlsx", sheet = "ema")
+bl_cb    <- read_excel(path = "01-codebook.xlsx", sheet = "baseline")
+var_labs <- read_excel(path = "01-codebook.xlsx", sheet = "labels")
+```
+
+### Functions 
+
+Throughout the code, there are a number of things we need to do multiple times that I've turned into helper functions to make that more efficient. This includes: 
+
+- Centering  
+- Standardizing (z-scoring) 
+- POMP-scoring based off a theoretical range (for likert-like scales) 
+- POMP-scoring based off an observed range (for count/accuracy/etc. scales) 
+- Rescoring NaNs as NAs 
+- Custom `ggplot2` theme
+- Extracting fixed effects from MELSM models in `brms` in a data frame 
+- Extracting random effects from MELSM models in `brms` in a data frame 
+- Generating predictions from MELSM models (needs to be done for both location and scale components) 
+- Generating fixed effects predictions for all models 
+- Generating random effects predictions for all models 
+- Conducting hypothesis tests of differences 
+- Creating caterpillar plots of person-level effects 
+- Creating distributions of random effects 
+- Estimating ICCs
+
+```{r}
+# Mean center variables
+center <- function(x) {
+  y <- x - mean(x, na.rm = T)
+  y[is.nan(y)] <- NA
+  return(y)
+}
+
+# z-score variables and deal with nans (all NA)
+zscore <- function(x) {
+  y <- (x - mean(x, na.rm = T))/sd(x, na.rm = T)
+  y[is.nan(y)] <- NA
+  return(y)
+}
+
+# POMP based on theoretical max & mix
+pomp <- function(x, mini = 1, maxi = 5) (x - mini)/(maxi - mini)*100
+
+# POMP based on observed max & min
+pomp_obs <- function(x) {
+  y <- (x - min(x, na.rm = T))/(max(x, na.rm = T)-min(x, na.rm = T))*100
+  y[is.nan(y)] <- NA
+  return(y)
+}
+
+# function to rescore NaN as NA
+rescore_nan <- function(x) {x[is.nan(x)] <- NA; x}
+```
+
+
+#### Custom Theme 
+
+```{r}
+# custom ggplot theme to reduce code
+my_theme <- function(){
+  theme_bw() +
+  theme(
+    legend.position = "bottom"
+    , legend.title = element_text(face = "bold", size = rel(1))
+    , legend.text = element_text(face = "italic", size = rel(1))
+    , axis.text = element_text(face = "bold", size = rel(1.1), color = "black")
+    , axis.title = element_text(face = "bold", size = rel(1.2))
+    , plot.title = element_text(face = "bold", size = rel(1.2), hjust = .5)
+    , plot.subtitle = element_text(face = "italic", size = rel(1.2), hjust = .5)
+    , strip.text = element_text(face = "bold", size = rel(1.1), color = "white")
+    , strip.background = element_rect(fill = "black")
+    )
+}
+```
+
+#### Fixed Effects 
+
+```{r}
+# broom.mixed doesn't play nice with MELSM 
+# alt function to get fixed effects into a data frame
+fx_fun <- function(m){
+  fx <- fixef(m) %>%
+    data.frame() %>% 
+    rownames_to_column("term") %>%
+    rename(lower = `Q2.5`, upper = `Q97.5`) %>%
+    mutate_at(vars(Estimate, lower, upper), ~ifelse(term=="sigma_Intercept", exp(.), .)) %>%
+    arrange(term) %>%
+    full_join(
+      VarCorr(m)$SID$sd %>%
+        data.frame() %>% 
+        rownames_to_column("term") %>%
+        mutate(term = paste("sd", term, sep = "_")) %>%
+        rename(lower = `Q2.5`, upper = `Q97.5`) %>%
+        mutate_at(vars(Estimate, lower, upper), ~ifelse(term=="sd_sigma_Intercept", exp(.), .))
+    )
+  
+  return(fx)
+}
+```
+
+#### Random Effects 
+
+```{r}
+# function to wrangle person-level effects into a df
+rx_fun <- function(m){
+  rx <- coef(m, probs = c(0.025, 0.975))[[1]] %>% array_tree(3) %>% 
+  tibble(term = names(.), data = .) %>% 
+  mutate(data = map(
+    data, ~(.) %>% 
+      data.frame() %>% 
+      rownames_to_column("SID")
+    )) %>% 
+  unnest(data) %>% 
+  select(SID, term, Estimate, lower = Q2.5, upper = Q97.5) %>%
+  mutate_at(vars(Estimate, lower, upper), ~ifelse(term == "sigma_Intercept", exp(.), .))
+  
+  return(rx)
+}
+```
+
+#### Predictions 
+
+```{r}
+call_pred_fun <- function(m, d, par, reform = NA){
+  d %>%
+    bind_cols(
+        fitted(m, newdata = ., dpar = par, re_formula = reform)
+    )
+}
+```
+
+##### Fixed Effects 
+```{r}
+pred_fx_fun <- function(m, pred, moder = NULL, covar = NULL){
+  mod <- if(moder == "none") NULL else moder
+  cov <- if(covar == "none") NULL else covar
+  frame <- crossing(
+    par = c("mu", "sigma")
+    , pred = seq(min(m$data[,pred]), max(m$data[,pred]), length.out = 100)
+    ) %>%
+    setNames(c("par", pred))
+  if(!is.null(mod)){
+    if(moder %in% c("age_c", "loneliness_gmc", "ss_quant_gmc", "ss_qual_gmc")){
+      d <- m$data %>% 
+        select(SID, mod_value_c) %>% 
+        distinct() %>%
+        summarize(m = mean(mod_value_c), sd = sd(mod_value_c))
+    } else {
+      d <- m$data %>%
+        group_by(SID) %>%
+        summarize(m = mean(mod_value_c), sd = sd(mod_value_c)) %>%
+        ungroup() %>%
+        summarize(m = mean(m), sd = mean(sd))
+    }
+    frame <- crossing(
+      frame, 
+      mod_value_c = c(d$m[1]-d$sd[1], d$m[1], d$m[1]+d$sd[1])
+    ) %>%
+      mutate(mod_fac = factor(
+        mod_value_c
+        , levels = c(d$m[1]-d$sd[1], d$m[1], d$m[1]+d$sd[1])
+        , labels = c("-1 SD", "M", "+1 SD")
+        )) 
+  }
+  # if(!is.null(cov)){
+    cols <- colnames(m$data)
+    cols <- cols[!cols %in% c("SID", "cog_value", pred, "mod_value_c")]
+    frame <- crossing(
+      frame
+      , tibble(cols, value = 0) %>% 
+          pivot_wider(names_from = "cols", values_from = "value")
+    )
+  # }
+  frame <- frame %>%
+    group_by(par) %>%
+    nest() %>%
+    ungroup() %>%
+    mutate(
+      data = map2(data, par, ~call_pred_fun(m, .x, .y, NA))
+      , par = factor(par, c("mu", "sigma"), c("Location", "Scale"))
+        ) %>%
+    unnest(data)
+  
+  if(m$family[1]$family == "lognormal"){
+    frame <- frame %>%
+      mutate_at(vars(Estimate:`Q97.5`), exp)
+  }
+  
+  return(frame)
+}
+```
+
+##### Person-Level Effects
+
+```{r}
+pred_rx_fun <- function(m, pred, moder = NULL, covar = NULL, rq){
+  mod <- if(moder == "none") NULL else moder
+  cov <- if(covar == "none") NULL else covar
+  
+  seq_fun <- function(x) seq(min(x$pred), max(x$pred), length.out = 100)
+  
+  frame <- if(rq == "RQ2"){
+    crossing(
+      par = c("mu", "sigma")
+      , m$data %>%
+          select(SID, one_of(pred)) %>%
+          setNames(c("SID", "pred")) %>%
+          group_by(SID) %>%
+          nest() %>%
+          ungroup() %>%
+          mutate(pred = map(data, seq_fun)) %>%
+          select(-data) %>%
+          unnest(pred) %>%
+          setNames(c("SID", pred))
+    )
+  } else {
+    crossing(
+      par = c("mu", "sigma")
+      , pred = seq(min(m$data[,pred]), max(m$data[,pred]), length.out = 100)
+      ) %>%
+      setNames(c("par", pred))
+  }
+  if(!is.null(mod)){
+    if(moder %in% c("age_c", "loneliness_gmc", "ss_quant_gmc", "ss_qual_gmc")){
+      d <- m$data %>% 
+        select(SID, mod_value_c) %>% 
+        distinct() %>%
+        summarize(m = mean(mod_value_c), sd = sd(mod_value_c))
+      frame <- crossing(
+        frame, 
+        mod_value_c = c(-1*d$sd[1], d$m[1], d$sd[1])
+      ) %>%
+        mutate(mod_fac = factor(
+          mod_value_c
+          , levels = c(-1*d$sd[1], d$m[1], d$sd[1])
+          , labels = c("-1 SD", "M", "+1 SD")
+          )) 
+    } else {
+      d <- m$data %>%
+        group_by(SID) %>%
+        summarize(
+          M = mean(mod_value_c)
+          , sd = sd(mod_value_c)
+          , `-1 SD` = M + 1*sd
+          , `+1 SD` = M - sd
+          ) %>%
+        select(-sd) %>%
+        pivot_longer(
+          cols = -SID
+          , names_to = "mod_fac"
+          , values_to = "mod_value_c"
+        )
+      frame <- if(!"SID" %in% colnames(frame)){
+        crossing(frame, d)
+      } else {
+        frame %>% full_join(d)
+      }
+    }
+  }
+  # if(!is.null(cov)){
+    cols <- colnames(m$data)
+    cols <- cols[!cols %in% c("SID", "cog_value", pred, "mod_value_c")]
+    d <- m$data %>% 
+          select(-one_of(c("cog_value", pred, "mod_value_c"))) %>%
+          group_by(SID) %>%
+          summarize_all(mean)
+    frame <- if(!"SID" %in% colnames(frame)){
+      crossing(frame, d)
+    } else {
+      frame %>% full_join(d)
+    }
+  # }
+  if(!"SID" %in% colnames(frame)){
+    frame <- crossing(
+      m$data %>% select(SID) %>% distinct() 
+      , frame
+    )
+  }
+  frame <- frame %>%
+    mutate(SID2 = SID) %>%
+    group_by(par, SID2) %>%
+    nest() %>%
+    ungroup() %>%
+    mutate(
+      data = map2(data, par, ~call_pred_fun(m, .x, .y, NULL))
+      , par = factor(par, c("mu", "sigma"), c("Location", "Scale"))
+        ) %>%
+    unnest(data)
+  
+  
+  if(m$family[1]$family == "lognormal"){
+    frame <- frame %>%
+      mutate_at(vars(Estimate:`Q97.5`), exp)
+  }
+  
+  return(frame)
+}
+```
+
+#### Hypothesis Tests 
+
+```{r}
+function(m, pred, moder){
+  mod <- if(moder == "none") NULL else moder
+  if(!is.null(mod)){
+    if(moder %in% c("age_c", "loneliness_gmc", "ss_quant_gmc", "ss_qual_gmc")){
+      d <- m$data %>% 
+        select(SID, mod_value_c) %>% 
+        distinct() %>%
+        summarize(m = mean(mod_value_c), sd = sd(mod_value_c))
+    } else {
+      d <- m$data %>%
+        group_by(SID) %>%
+        summarize(m = mean(mod_value_c), sd = sd(mod_value_c)) %>%
+        ungroup() %>%
+        summarize(m = mean(m), sd = mean(sd))
+    }
+    vals <- c(-1*d$sd[1], d$m[1], d$sd[1])
+  }
+  
+  hyp <- c(
+    "Location_-1 SD"   = sprintf("%s + %s*%s:mod_value_c = 0", pred, d$m[1]-1*d$sd[1], pred)
+    , "Location_-M"    = sprintf("%s + %s*%s:mod_value_c = 0", pred, d$m[1], pred)
+    , "Location_+1 SD" = sprintf("%s + %s*%s:mod_value_c = 0", pred, d$m[1]+1*d$sd[1], pred)
+    , "Location_+1 SD v. -1 SD" = sprintf("%s*2*%s:mod_value_c = 0", d$sd[1], pred)
+    , "Scale_-1 SD"    = sprintf("sigma_%s + %s*sigma_%s:mod_value_c = 0", pred, d$m[1]-1*d$sd[1], pred)
+    , "Scale_-M"       = sprintf("sigma_%s + %s*sigma_%s:mod_value_c = 0", pred, d$m[1], pred)
+    , "Scale_+1 SD"    = sprintf("sigma_%s + %s*sigma_%s:mod_value_c = 0", pred, d$m[1]+1*d$sd[1], pred)
+    , "Scale_+1 SD v. -1 SD" = sprintf("%s*2*sigma_%s:mod_value_c = 0", d$sd[1], pred)
+    )
+  h <- hypothesis(m, hyp)$hypothesis %>%
+    separate(Hypothesis, c("par", "mod_value_c"), sep = "_")
+  
+  h <- hypothesis(m, hyp, scope = "coef", group = "SID")$hypothesis %>%
+    separate(Hypothesis, c("par", "mod_value_c"), sep = "_") %>%
+    rename(SID = Group)
+}
+```
+
+
+#### Caterpillar Plot 
+
+```{r}
+cat_plot <- function(d, term){
+  d %>% 
+  arrange(desc(Estimate)) %>%
+  mutate(SID = forcats::fct_inorder(SID)
+         , sig = ifelse(sign(lower) == sign(upper), "sig", "ns")) %>%
+  ggplot(aes(x = Estimate, y = SID)) + 
+    geom_errorbar(
+      aes(xmin = lower, xmax = upper, alpha = sig)
+      , width = 0
+      , position = "dodge"
+      , linewidth = .25
+      ) + 
+    geom_point(
+      aes(color = sig)
+      , shape = "square"
+      , size = 1.5
+      ) + 
+    scale_color_manual(values = c("sig" = "blue", "ns" = "grey")) + 
+    scale_alpha_manual(values = c("sig" = .75, "ns" = .15)) + 
+    labs(title = term) + 
+    my_theme() + 
+    theme(axis.text.y = element_text(size = rel(.3))
+          , legend.position = "none")
+}
+```
+
+#### Distributions of Random Effects
+
+```{r}
+rf_dist <- function(rf, rq, category){
+  subttl <- str_wrap(unique(str_remove_all(rf$comb, "Momentary ")), 27)
+  ttl <- if(rq == "RQ2a") category else NULL
+  colr <- if(category == "Location") "#9AA0F9" else "#9AA0F9"
+  if(category == "Location"){
+    lims <- if(rq == "RQ2a") c(-.6, .6) else c(-.35, .35)
+    brks <- if(rq == "RQ2a") seq(-.5, .5, .25) else seq(-.3, .3, .15)
+  } else {
+    lims <- if(rq == "RQ2a") c(-.15, .15) else c(-.03, .03)
+    brks <- if(rq == "RQ2a") seq(-.1, .1, .1) else seq(-.02, .02, .01)
+  }
+  rf %>%
+    ggplot(aes(x = Estimate)) + 
+      geom_density(alpha = .75, fill = colr) + 
+      geom_vline(aes(xintercept = 0), linetype = "dashed") + 
+      # facet_grid(comb~., scales = "free") + 
+      my_theme() + 
+      labs(
+        , y = "Density"
+        , title = ttl
+        , subtitle = subttl, #"Distribution of Random Effects"
+        , x = "WP Assoc."
+        ) + 
+      scale_x_continuous(limits = lims, breaks = brks) + 
+      theme(legend.position = "none")
+}
+```
+
+#### ICC 
+
+$$
+ICC = \frac{\tau^2_{00}}{(\tau^2_{00}+\sigma^2)}
+$$
+
+```{r}
+ICC <- function(m){
+  vc <- VarCorr(m)
+  tau_02 <- vc$SID$sd[1,"Estimate"]^2
+  sigma2 <- vc$SID$sd[2,"Estimate"]^2
+  icc <- tau_02/(tau_02+sigma2)
+  return(icc)
+}
+```
+
+

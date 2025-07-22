@@ -1,0 +1,738 @@
+---
+title: "03-tables-and-figures"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+
+# Research Question 1: Loneliness Instability
+
+Now that all models are run, we can extract key points and turn them into tables and figures. We'll do this for RQ1 first. Below is a function that loads in the fixed and random effects summaries for all models and stores them in a nested data frame. 
+
+```{r}
+loadRData <- function(fileName, obj, path){
+#loads an RData file, and returns it
+    load(sprintf("%s/%s", path, fileName))
+    get(ls()[ls() == obj])
+}
+
+nested_rq1 <- tibble(file = list.files("03-results/RQ1/summary/")) %>%
+  mutate(
+    fx = map(file, ~loadRData(., "fx", "03-results/RQ1/summary"))
+    , rx = map(file, ~loadRData(., "rx", "03-results/RQ1/summary"))
+    ) %>%
+  separate(file, c("outcome", "outcome_time", "moder", "cov"), sep = "-") %>%
+  mutate(cov = str_remove_all(cov, ".RData")) 
+```
+
+## Tables 
+Next, we'll create tables both (1) with all terms separately for each model and (2) with key terms across RQs and outcomes, split by covariates and focal v. robustness tests. 
+
+### All Terms 
+
+First, let's create tables that include all terms in the model for transparency. These will be available as online materials. 
+
+```{r}
+round_fun <- function(x) if(!is.na(x)) if(abs(x) > .005) sprintf("%.2f", x) else sprintf("%.3f", x) else ""
+em <- function(x) paste0("<em>", x, "</em>")
+strong <- function(x) paste0("<strong>", x, "</strong>")
+
+format_fun <- function(d){
+  d %>%
+    mutate(sig = ifelse(sign(lower) == sign(upper), "sig", "ns")) %>%
+    rowwise() %>%
+    mutate_at(vars(Estimate, lower, upper), round_fun) %>%
+    ungroup() %>%
+    mutate(CI = sprintf("[%s,%s]", lower, upper)) %>%
+    mutate_at(vars(Estimate, CI), ~ifelse(sig == "sig" & !is.na(sig), sprintf("<strong>%s</strong>", .), .)) 
+}
+
+rq1_all_terms_tab <- function(d, outcome, outtime, moder, cov){
+  tab <- d %>% 
+    select(-Est.Error) %>%
+    format_fun() %>%
+    mutate(
+      category = ifelse(grepl("sigma", term), "Scale", "Location")
+      , term = str_remove_all(term, "sigma_")
+      # , term = str_replace_all(term, "Instability", "Stability")
+      ) %>%
+    select(category, term, Estimate, CI) %>%
+    kable(
+      "html"
+      , escape = F
+      , col.names = c("Category", "Term", "Estimate", "CI")
+      , align = c("l", "l", "c", "c")
+      , caption = sprintf("<strong>Table SX</strong><br><em>All RQ1 MELSM Model Terms for %s %s, %s, %s</em>", outtime, outcome, moder, cov)
+    ) %>%
+    kable_classic(full_width = F, html_font = "Times") %>%
+    collapse_rows(1, valign = "top")
+  save_kable(tab, file = sprintf("03-results/RQ1/tables/all-terms/%s-%s-%s-%s.html", outcome, outtime, moder, cov))
+}
+
+nested_rq1 %>% 
+  mutate(tab = pmap(list(fx, outcome, outcome_time, moder, cov), rq1_all_terms_tab))
+```
+
+### Key Terms 
+
+Next, let's create the tables of key terms. We have 8 total outcomes (4 tests x 2 metrics), 4 sets of RQs, 4 RQs, and a moderator analysis. We'll split this into focal (cognitive composites) v. supplementary (cognitive domains) crossed with the covariate set. Location adjusted covariates for focal models will become Table 1 and all others will be supplementary tables. 
+
+```{r}
+s_tab <<- 2
+rq1_key_terms_tab <- function(d, cov, focal){
+  rs <- d %>% group_by(outcome) %>% tally() %>% 
+      mutate(end = cumsum(n), start = lag(end) + 1, start = ifelse(is.na(start), 1, start))
+  
+  if(cov == "location" & focal == "focal") {
+    tab_num <- "1" 
+  } else {
+    tab_num <- paste0("S", s_tab)
+    s_tab <<- s_tab + 1
+  }
+  cap <- sprintf("<strong>Table %s</strong><br><em>Key RQ1 MELSM Model Terms for %s</em>", tab_num, cov)
+  hdr1 <- c(2, 1, 1); names(hdr1) <- c(" ", "Location", "Scale")
+  
+  
+  tab <- d %>% 
+    select(-outcome, -moder) %>%
+    kable(
+      "html"
+      , escape = F
+      , col.names = c("RQ", "Term", rep("Estimate [CI]", 2))
+      , align = c("l", "l", rep("c", 2))
+      , caption = cap
+    ) %>%
+    kable_classic(full_width = F, html_font = "Times") %>%
+    add_header_above(hdr1) 
+  # for loop to add grouped sections 
+  for (i in 1:nrow(rs)){
+    tab <- tab %>% 
+      kableExtra::group_rows(rs$outcome[i], rs$start[i], rs$end[i]) 
+  }
+  save_kable(tab, file = sprintf("03-results/RQ1/tables/key-terms/tab%s-%s-%s.html", tab_num, cov, focal))
+  return(tab)
+}
+
+nested_rq1_tabs <- nested_rq1 %>%
+  select(-rx) %>%
+  unnest(fx) %>%
+  filter( # keep key terms
+    (moder == "none" & grepl("lonely_mssd", term)) |
+    (moder != "none" & (grepl("lonely_mssd:mod_value_c", term) | grepl("mod_value_c:", term))) 
+    ) %>%
+  filter(!grepl("sd_", term)) %>%
+  mutate( # reformat terms
+    term = str_replace_all(term, "mod_value_c", moder)
+    , category = ifelse(grepl("sigma", term), "Scale", "Location")
+    , term = str_remove_all(term, "sigma_")
+    ) %>%
+  format_fun() %>%
+  mutate(Estimate = sprintf("%s<br>%s", Estimate, CI)) %>%
+  select(category, outcome:term, Estimate, -outcome_time) %>%
+  pivot_wider( # reshape for more concise viewing
+    names_from = "category"
+    , values_from = "Estimate"
+  ) %>%
+  mutate(
+    focal = ifelse(grepl("cog_", outcome), "focal", "sup")
+    , rq = factor(moder, c("none", "loneliness_gmc", "ss_quant_gmc", "ss_qual_gmc", "age_c")
+                  , c("RQ1a", "RQ1b", "RQ1c", "RQ1d", "Sensitivity"))
+    , term = mapvalues(term, var_labs$var, var_labs$label)
+    , outcome = factor(outcome, var_labs$var, var_labs$label)
+    ) %>%
+  select( # reorder columns
+    outcome, rq, cov, focal, moder, term
+    , matches("Location")
+    , matches("Scale")
+    ) %>%
+  arrange(outcome, focal, rq, cov, rq) %>%
+  group_by(focal, cov) %>%
+  nest() %>% # nest by covariate 
+  ungroup() %>%
+  mutate(tab = pmap(list(data, cov, focal), rq1_key_terms_tab))
+
+nested_rq1_tabs %>% select(-data) %>% filter(cov == "location" & focal == "focal") %>% pull(tab)
+nested_rq1_tabs %>% select(-data) %>% filter(cov == "location" & focal == "sup") %>% pull(tab)
+```
+
+## Figures 
+### Simple Effects 
+
+First, we'll plot the simple effects of the fixed effects predictions for both location and scale. But first, we need to load in the predictions we generated when we ran the models. 
+
+```{r}
+loadRData <- function(fileName, obj, path){
+#loads an RData file, and returns it
+    load(sprintf("%s/%s", path, fileName))
+    get(ls()[ls() == obj])
+}
+
+nested_rq1_pred <- tibble(file = list.files("03-results/RQ1/predicted/")) %>%
+  mutate(
+    fx_pred = map(file, ~loadRData(., "fx_pred", "03-results/RQ1/predicted"))
+    , rx_pred = map(file, ~loadRData(., "rx_pred", "03-results/RQ1/predicted"))
+    ) %>%
+  separate(file, c("outcome", "outcome_time", "moder", "cov"), sep = "-") %>%
+  mutate(cov = str_remove_all(cov, ".RData")) %>%
+  filter(cov == "location")
+
+```
+
+Next, we'll create a function that will plot the predicted associations as a function of the moderators with instability as the x-axis and the cognitive outcome as the y-axis separately for both location and scale. Then, a second function will combine location and scale into a single plot. Lastly, we'll created figures that combine all credible effects into a single plot for manuscript inclusion. 
+
+```{r}
+rq1_fx_pred_plot_fun <- function(fx, par, outcome, moder, cov){
+  # lims <- if(par == "Location") c(70, 90) else c(0, 10)
+  out <- mapvalues(outcome, var_labs$var, var_labs$label, warn_missing = F)
+  mod <- mapvalues(moder, var_labs$var, var_labs$label, warn_missing = F)
+  ylab <- if(par == "Location" & outcome %in% c("cog_comp", "dsm_score", "vpa_score", "nback_score", "cog_medianRT")){
+    str_wrap(sprintf("Estimated %s (0-100)", out), 25)
+  } else if( par == "Scale") {
+    str_wrap(sprintf("Estimated %s (SD)", out), 25)
+  } else {
+    str_wrap(sprintf("Estimated %s", out), 25)
+  }
+  fx %>% 
+    filter(lonely_mssd <= 10) %>%
+    ggplot(aes(
+      x = lonely_mssd
+      , y = Estimate
+      , fill = mod_fac
+      )) + 
+    geom_ribbon(
+      aes(ymin = `Q2.5`, ymax = `Q97.5`)
+      , alpha = .25
+      ) + 
+    geom_line(
+      aes(color = mod_fac)
+    ) + 
+    labs(
+      subtitle = par
+      , x = "Loneliness Instability"
+      , y = ylab
+      , fill = mod
+      , color = mod
+    ) + 
+    scale_x_continuous(limits = c(0, 10), breaks = seq(0, 10, 1)) +
+    # scale_y_continuous(limits = lims) +  
+    scale_fill_brewer(palette = "Set2") +
+    scale_color_brewer(palette = "Dark2") + 
+    my_theme()
+}
+
+comb_plot <- function(p, outcome, moder, cov){
+  out <- mapvalues(outcome, var_labs$var, var_labs$label, warn_missing = F)
+  pp <- p$p[[1]] + p$p[[2]] +
+    plot_annotation(
+      title = out,
+      # subtitle = 'These 3 plots will reveal yet-untold secrets about our beloved data-set',
+      caption = 'Disclaimer: None of these plots are insightful'
+      , theme = my_theme()
+      ) + 
+  plot_layout(
+    guides = 'collect'
+    )
+  ggsave(pp, file = sprintf("03-results/RQ1/plots/fx-simple-effects/%s-%s-%s.png", outcome, moder, cov), width = 8, height = 4)
+  ggsave(pp, file = sprintf("03-results/RQ1/plots/fx-simple-effects/%s-%s-%s.pdf", outcome, moder, cov), width = 8, height = 4)
+}
+
+nested_rq1_plots <- nested_rq1_pred %>% 
+  select(-rx_pred) %>%
+  mutate(fx_pred = map(fx_pred, ~(.) %>% group_by(par) %>% nest() %>% ungroup())) %>%
+  unnest(fx_pred) %>%
+  mutate(p = pmap(list(data, par, outcome, moder, cov), possibly(rq1_fx_pred_plot_fun, NA_real_))) %>%
+  select(-data) %>%
+  left_join(
+    nested_rq1 %>%
+      select(-rx) %>%
+      unnest(fx) %>%
+      filter( # keep key terms
+        (moder == "none" & grepl("lonely_mssd", term)) |
+        (moder != "none" & (grepl("lonely_mssd:mod_value_c", term) | grepl("mod_value_c:", term))) 
+        ) %>%
+      filter(!grepl("sd_", term)) %>%
+      mutate(sig = ifelse(sign(lower) == sign(upper), "sig", "ns")
+             , par = ifelse(grepl("sigma", term), "Scale", "Location")) %>%
+      select(outcome:cov, sig, par) 
+  ) %>%
+  group_by(outcome, outcome_time, moder, cov) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(p2 = pmap(list(data, outcome, moder, cov), possibly(comb_plot, NA_real_)))
+
+(nested_rq1_plots %>% filter(moder == "age_c" & cov == "location"))$p[[3]]
+
+
+comb_plot <- function(p, focal, cov){
+  np <- nrow(p)
+  nr <- if(np > 2) 2 else 1
+  pp <- wrap_plots(p$p, nrow = nr) 
+  ggsave(pp, file = sprintf("03-results/RQ1/plots/fx-simple-effects/sig/%s-%s.png", focal, cov), width = 10, height = 8)
+  ggsave(pp, file = sprintf("03-results/RQ1/plots/fx-simple-effects/sig/%s-%s.pdf", focal, cov), width = 10, height = 8)
+}
+
+edit_plot <- function(p, par, outcome, moder){
+  out <- mapvalues(outcome, var_labs$var, var_labs$label, warn_missing = F)
+  mod <- mapvalues(moder, var_labs$var, var_labs$label, warn_missing = F)
+  p + 
+    labs(
+      title = sprintf("%s:\n %s", out, mod)
+      , subtitle = par
+    )
+}
+
+nested_rq1_sig <- nested_rq1_plots %>%
+  select(-p2) %>%
+  unnest(data) %>% 
+  filter(sig == "sig") %>%
+  mutate(
+    focal = ifelse(grepl("cog_", outcome), "focal", "sup")
+    , rq = factor(moder, c("none", "loneliness_gmc", "ss_quant_gmc", "ss_qual_gmc", "age_c")
+                  , c("RQ1a", "RQ1b", "RQ1c", "RQ1d", "Sensitivity"))
+    , outcome = factor(outcome, var_labs$var, var_labs$label)
+    ) %>%
+  mutate(p = pmap(list(p, par, outcome, moder), edit_plot)) %>%
+  group_by(focal, cov) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(p = pmap(list(data, focal, cov), comb_plot))
+```
+
+# Research Question 2: Loneliness Fluctuations
+
+Now, we repeat the same procedure from above but for RQ2. 
+
+```{r}
+loadRData <- function(fileName, obj, path){
+#loads an RData file, and returns it
+    load(sprintf("%s/%s", path, fileName))
+    get(ls()[ls() == obj])
+}
+
+nested_rq2 <- tibble(file = list.files("03-results/RQ2/summary/")) %>%
+  mutate(
+    fx = map(file, ~loadRData(., "fx", "03-results/RQ2/summary"))
+    , rx = map(file, ~loadRData(., "rx", "03-results/RQ2/summary"))
+    ) %>%
+  separate(file, c("outcome", "outcome_time", "moder", "cov"), sep = "-") %>%
+  mutate(cov = str_remove_all(cov, ".RData")) 
+```
+
+## Tables 
+### All Terms 
+
+First, let's create tables that include all terms in the model for transparency. These will be available as online materials. 
+
+```{r}
+round_fun <- function(x) if(!is.na(x)) if(abs(x) > .005) sprintf("%.2f", x) else sprintf("%.3f", x) else ""
+em <- function(x) paste0("<em>", x, "</em>")
+strong <- function(x) paste0("<strong>", x, "</strong>")
+
+format_fun <- function(d){
+  d %>%
+    mutate(sig = ifelse(sign(lower) == sign(upper), "sig", "ns")) %>%
+    rowwise() %>%
+    mutate_at(vars(Estimate, lower, upper), round_fun) %>%
+    ungroup() %>%
+    mutate(CI = sprintf("[%s,%s]", lower, upper)) %>%
+    mutate_at(vars(Estimate, CI), ~ifelse(sig == "sig" & !is.na(sig), sprintf("<strong>%s</strong>", .), .)) 
+}
+
+rq2_all_terms_tab <- function(d, outcome, outtime, moder, cov){
+  tab <- d %>% 
+    select(-Est.Error) %>%
+    format_fun() %>%
+    mutate(
+      category = ifelse(grepl("sigma", term), "Scale", "Location")
+      , term = str_remove_all(term, "sigma_")
+      ) %>%
+    select(category, term, Estimate, CI) %>%
+    kable(
+      "html"
+      , escape = F
+      , col.names = c("Category", "Term", "Estimate", "CI")
+      , align = c("l", "l", "c", "c")
+      , caption = sprintf("<strong>Table SX</strong><br><em>All RQ2 MELSM Model Terms for %s %s, %s, %s</em>", outtime, outcome, moder, cov)
+    ) %>%
+    kable_classic(full_width = F, html_font = "Times") %>%
+    collapse_rows(1, valign = "top")
+  save_kable(tab, file = sprintf("03-results/RQ2/tables/all-terms/%s-%s-%s-%s.html", outcome, outtime, moder, cov))
+}
+
+nested_rq2 %>% 
+  mutate(tab = pmap(list(fx, outcome, outcome_time, moder, cov), rq2_all_terms_tab))
+```
+
+### Key Terms 
+
+Next, let's create the tables of key terms. We have 8 total outcomes (4 tests x 2 metrics), 4 sets of RQs, 4 RQs, and a moderator analysis. We'll split this into focal (cognitive composites) v. supplementary (cognitive domains) crossed with the covariate set. Location adjusted covariates for focal models will become Table 1 and all others will be supplementary tables. 
+
+
+```{r}
+format_fun <- function(d){
+  d %>%
+    mutate(sig = ifelse(sign(lower) == sign(upper), "sig", "ns")) %>%
+    rowwise() %>%
+    mutate_at(vars(Estimate, lower, upper), round_fun) %>%
+    ungroup() %>%
+    mutate(CI = sprintf("[%s,%s]", lower, upper)) %>%
+    mutate_at(vars(Estimate, CI), ~ifelse(sig == "sig" & !is.na(sig) & type != "Random", sprintf("<strong>%s</strong>", .), .)) 
+}
+
+rq2_key_terms_tab <- function(d, cov, focal){
+  rs <- d %>% group_by(outcome) %>% tally() %>% 
+      mutate(end = cumsum(n), start = lag(end) + 1, start = ifelse(is.na(start), 1, start))
+  
+  if(cov == "location" & focal == "focal") {
+    tab_num <- "2" 
+  } else {
+    tab_num <- paste0("S", s_tab)
+    s_tab <<- s_tab + 1
+  }
+  cap <- sprintf("<strong>Table %s</strong><br><em>Key RQ2 MELSM Model Terms for %s</em>", tab_num, cov)
+  
+  hdr1 <- c(2, 4, 4); names(hdr1) <- c(" ", strong(c("Location", "Scale")))
+  hdr2 <- c(2, rep(2, 4)); names(hdr2) <- c(" ", strong(rep(c("Concurrent", "Prospective"), times = 2)))
+  hdr3 <- c(2, rep(1, 8)); names(hdr3) <- c(" ", strong(rep(c("Fixed", "Random"), times = 4)))
+  
+  tab <- d %>% 
+    select(-outcome, -moder) %>%
+    kable(
+      "html"
+      , escape = F
+      , col.names = strong(c("RQ", "Term", rep(c("Estimate [<em>CI</em>]", "<em>SD</em> [<em>CI</em>]"), times = 4)))
+      , align = c("l", "l", rep("c", 8))
+      , caption = cap
+    ) %>%
+    kable_classic(full_width = F, html_font = "Times") %>%
+    add_header_above(hdr2, escape = F) %>%
+    add_header_above(hdr1, escape = F) 
+  # for loop to add grouped sections 
+  for (i in 1:nrow(rs)){
+    tab <- tab %>% 
+      kableExtra::group_rows(rs$outcome[i], rs$start[i], rs$end[i]) 
+  }
+  save_kable(tab, file = sprintf("03-results/RQ2/tables/key-terms/tab%s-%s-%s.html", tab_num, cov, focal))
+  return(tab)
+}
+
+s_tab <<- 9 # for counting the supplementary tables
+
+nested_rq2_tabs <- nested_rq2 %>%
+  select(-rx) %>%
+  unnest(fx) %>%
+  filter( # keep key terms
+    (moder == "none" & grepl("lonely_wpc", term)) |
+    (moder != "none" & (grepl("lonely_wpc:mod_value_c", term) | grepl("mod_value_c:", term))) 
+    ) %>%
+  mutate( # reformat terms
+    term = str_replace_all(term, "mod_value_c", moder)
+    , category = ifelse(grepl("sigma", term), "Scale", "Location")
+    , term = str_remove_all(term, "sigma_")
+    , type = ifelse(grepl("sd_", term), "Random", "Fixed")
+    , term = str_remove_all(term, "sd_")
+    ) %>%
+  format_fun() %>%
+  mutate(Estimate = sprintf("%s<br>%s", Estimate, CI)) %>%
+  select(category, outcome:term, type, Estimate) %>%
+  pivot_wider( # reshape for more concise viewing
+    names_from = c("category", "outcome_time", "type")
+    , values_from = "Estimate"
+  ) %>%
+  mutate(
+    focal = ifelse(grepl("cog_", outcome), "focal", "sup")
+    , rq = factor(moder, c("none", "loneliness_gmc", "ss_quant_wpc", "ss_qual_wpc", "age_c")
+                  , c("RQ2a", "RQ2b", "RQ2c", "RQ2d", "Sensitivity"))
+    , term = mapvalues(term, var_labs$var, var_labs$label)
+    , outcome = factor(outcome, var_labs$var, var_labs$label)
+    ) %>%
+  select( # reorder columns
+    outcome, rq, cov, focal, moder, term
+    , matches("Location_contemp"), matches("Location_prosp")
+    , matches("Scale_contemp"), matches("Scale_prosp")
+    ) %>%
+  arrange(outcome, focal, rq, cov, rq) %>%
+  group_by(focal, cov) %>%
+  nest() %>% # nest by covariate 
+  ungroup() %>%
+  mutate(tab = pmap(list(data, cov, focal), rq2_key_terms_tab))
+
+nested_rq2_tabs %>% select(-data) %>% filter(cov == "location" & focal == "focal") %>% pull(tab)
+nested_rq2_tabs %>% select(-data) %>% filter(cov == "location" & focal == "sup") %>% pull(tab)
+```
+
+## Figures 
+For RQ2, we have within-person effects, so we will have new plots (specifically caterpillar plots and density distributions) that we did not have in RQ1. In addition, we will have the prediction plots as in RQ1.  
+
+### Random Effects 
+#### Caterpillar Plots
+
+Caterpillar plots show all effect sizes and interval estimates across people. The code below will generate these for all model terms with random effects separately and then combine them into a single plot, which will be outputted. 
+
+```{r}
+comb_plot <- function(p, outcome, outtime, moder, covar){
+  out <- mapvalues(outcome, var_labs$var, var_labs$label, warn_missing = F)
+  ott <- mapvalues(outtime, c("contemp", "prosp"), c("Concurrent", "Prospective"), warn_missing = F)
+  mod <- mapvalues(moder, var_labs$var, var_labs$label, warn_missing = F)
+  cov <- mapvalues(covar, var_labs$var, var_labs$label, warn_missing = F)
+  np <- nrow(p)
+  nr <- if(np > 2) 2 else 1
+  nc <- if(np > 4) 3 else 2
+  ht <- if(np > 2) 9 else 6
+  wt <- if(np > 4) 9 else 6
+  p2 <- wrap_plots(p$p, nrow = nr, ncol = nc, byrow = T) + 
+    plot_annotation(
+      title = str_wrap(sprintf("%s %s: %s", ott, out, mod), 50)
+      , subtitle = cov
+      , caption = 'Disclaimer: None of these plots are insightful'
+      , theme = my_theme()
+      ) 
+  ggsave(p2, file = sprintf("03-results/RQ2/plots/caterpillar-plots/%s-%s-%s-%s.png", outcome, outtime, moder, covar), width = wt, height = ht)
+  ggsave(p2, file = sprintf("03-results/RQ2/plots/caterpillar-plots/%s-%s-%s-%s.pdf", outcome, outtime, moder, covar), width = wt, height = ht)
+  return(p2)
+}
+
+nested_rq2_cat <- nested_rq2 %>%
+  select(-fx) %>%
+  mutate(rx = map(rx, ~(.) %>% group_by(term) %>% nest() %>% ungroup())) %>%
+  unnest(rx) %>%
+  filter(grepl("lonely_wpc|Intercept|ss_", term) & !(grepl("age_|lonely_gmc", moder) & grepl("mod_value_c", term))) %>%
+  
+  mutate(p = map2(data, term, possibly(cat_plot, NA_real_))) %>%
+  filter(!is.na(p)) %>% 
+  arrange(outcome, outcome_time, moder, cov, term) %>%
+  group_by(outcome, outcome_time, moder, cov) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(p = pmap(list(data, outcome, outcome_time, moder, cov), comb_plot))
+nested_rq2_cat
+```
+
+#### Distributions 
+
+Next, we plot simple distributions of the random effects, which aid relative comparisons in shape and magnitude across predictors and outcomes. 
+
+```{r}
+nested_rq2_dist <- nested_rq2 %>%
+  select(-fx) %>%
+  unnest(rx) %>%
+  filter( # keep key terms
+    (moder == "none" & grepl("lonely_wpc", term)) |
+    (moder != "none" & (grepl("lonely_wpc:mod_value_c", term) | grepl("mod_value_c:", term))) 
+    ) %>%
+  group_by(outcome, outcome_time, moder, cov, term) %>%
+  filter(sd(Estimate) != 0) %>%
+  ungroup() %>%
+  mutate(
+    term = str_replace_all(term, "mod_value_c", moder)
+    , category = ifelse(grepl("sigma", term), "Scale", "Location")
+    , term = str_remove_all(term, "sigma_")
+    , focal = ifelse(grepl("cog_", outcome), "focal", "sup")
+    , rq = factor(moder, c("none", "loneliness_gmc", "ss_quant_wpc", "ss_qual_wpc", "age_c")
+                  , c("RQ2a", "RQ2b", "RQ2c", "RQ2d", "Sensitivity"))
+    , term = mapvalues(term, var_labs$var, var_labs$label)
+    , outcome = mapvalues(outcome, var_labs$var, var_labs$label)
+    , comb = sprintf("%s: %s", rq, term)
+    ) %>%
+  group_by(focal, outcome, outcome_time, category, rq, term, cov) %>%
+  nest() %>% 
+  ungroup() %>%
+  mutate(p = pmap(list(data, rq, category), rf_dist)) %>%
+  filter(!is.na(p))
+nested_rq2_dist$p[[3]]
+
+comb_col <- function(x, category){
+  p2 <- wrap_plots(
+    x$p
+    , ncol = 1
+    ) 
+}
+
+nested_rq2_dist <- nested_rq2_dist %>%
+  arrange(outcome, category, outcome_time, cov, focal, rq) %>%
+  group_by(outcome, category, outcome_time, cov, focal) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(p = map2(data, category, comb_col))
+nested_rq2_dist$p[[2]]
+
+comb_plot <- function(x, outcome, outtime, covar){
+  ot <- mapvalues(outtime, c("contemp", "prosp"), c("Concurrent", "Prospective"), warn_missing = F)
+  p2 <- wrap_plots(x$p, ncol = 2) + 
+    plot_annotation(
+      title = sprintf("%s (%s)", outcome, ot)#str_wrap(sprintf("%s %s: %s", ott, out, mod), 50)
+      # , subtitle = cateogry
+      , caption = 'Disclaimer: None of these plots are insightful'
+      , theme = my_theme()
+      ) 
+  ggsave(p2, file = sprintf("03-results/RQ2/plots/rx-distributions/%s-%s-%s.png", outcome, outtime, covar), width = 6, height = 10)
+  ggsave(p2, file = sprintf("03-results/RQ2/plots/rx-distributions/%s-%s-%s.pdf", outcome, outtime, covar), width = 6, height = 10)
+  return(p2)
+}
+
+nested_rq2_dist <- nested_rq2_dist %>%
+  group_by(outcome, outcome_time, cov, focal) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(p = pmap(list(data, outcome, outcome_time, cov), comb_plot))
+
+nested_rq2_dist$p[[7]]
+```
+
+### Simple Effects 
+
+Lastly, we'll load in the prediction data and plot all the fixed effect prediction plots. Momentary loneliness will be on the x-axis and predicted cognitive function will be on the y-axis. 
+
+```{r}
+loadRData <- function(fileName, obj, path){
+#loads an RData file, and returns it
+    load(sprintf("%s/%s", path, fileName))
+    get(ls()[ls() == obj])
+}
+
+nested_rq2_pred <- tibble(file = list.files("03-results/RQ2/predicted/")) %>%
+  mutate(
+    fx_pred = map(file, ~loadRData(., "fx_pred", "03-results/RQ2/predicted"))
+    , rx_pred = map(file, ~loadRData(., "rx_pred", "03-results/RQ2/predicted"))
+    ) %>%
+  separate(file, c("outcome", "outcome_time", "moder", "cov"), sep = "-") %>%
+  mutate(cov = str_remove_all(cov, ".RData")) %>%
+  filter(cov == "location")
+```
+
+```{r}
+rq2_fx_pred_plot_fun <- function(fx, par, outcome, moder, cov){
+  lims <- if(par == "Location") c(round_any(min(fx$Q2.5), 5, f = floor) - 5,  round_any(max(fx$Q97.5), 5, f = ceiling) + 5) else c(round_any(min(fx$Q2.5), 1, f = floor),  round_any(max(fx$Q97.5), 1, f = ceiling))
+  # lims <- if(par == "Location") c(0, 100) else c(0, 10)
+  out <- mapvalues(outcome, var_labs$var, var_labs$label, warn_missing = F)
+  mod <- mapvalues(moder, var_labs$var, var_labs$label, warn_missing = F)
+  rq <- mapvalues(moder, c("none", "loneliness_gmc", "ss_quant_wpc", "ss_qual_wpc", "age_c")
+                  , c("RQ2a", "RQ2b", "RQ2c", "RQ2d", "Sensitivity"))
+  ylab <- if(par == "Location" & outcome %in% c("cog_comp", "dsm_score", "vpa_score", "nback_score", "cog_medianRT")){
+    str_wrap(sprintf("Estimated %s (0-100)", out), 25)
+  } else if( par == "Scale") {
+    str_wrap(sprintf("Estimated %s (SD)", out), 25)
+  } else {
+    str_wrap(sprintf("Estimated %s", out), 25)
+  }
+  # if(grepl("RT", outcome)) fx <- fx %>% mutate_at(vars(Estimate, `Q2.5`, `Q97.5`), exp)
+  fx %>%
+    ggplot(aes(
+      x = lonely_wpc
+      , y = Estimate
+      , fill = mod_fac
+      , color = mod_fac
+      # , fill_ramp = after_stat(.width)
+      )) + 
+    geom_lineribbon(
+      aes(ymin = `Q2.5`, ymax = `Q97.5`)
+      , linewidth = .75
+      , alpha = .25
+      ) +
+    # geom_ribbon(
+    #   aes(ymin = `Q2.5`, ymax = `Q97.5`)
+    #   , alpha = .25
+    #   ) +
+    geom_line(
+      aes(color = mod_fac)
+      , linewidth = .75
+    ) +
+    labs(
+      title = par
+      , x = "Momentary Loneliness\n(Within-Person Centered)"
+      , y = ylab
+      , fill = mod
+      , color = mod
+    ) + 
+    scale_fill_brewer(palette = "Set2") +
+    scale_color_brewer(palette = "Dark2") + 
+    scale_x_continuous(limits = c(-10, 10), breaks = seq(-10, 10, 2)) +
+    scale_y_continuous(limits = lims) +
+    my_theme()
+}
+
+comb_plot <- function(p, outcome, outcome_time, moder, cov){
+  rq <- mapvalues(moder, c("none", "loneliness_gmc", "ss_quant_wpc", "ss_qual_wpc", "age_c")
+                  , c("RQ2a", "RQ2b", "RQ2c", "RQ2d", "Sensitivity"))
+  mod <- mapvalues(moder, var_labs$var, var_labs$label, warn_missing = F)
+  out <- mapvalues(outcome, var_labs$var, var_labs$label, warn_missing = F)
+  pp <- p$p[[1]] + p$p[[2]] +
+    plot_annotation(
+      title = sprintf("%s: %s Moderation of %s", rq, mod, out),
+      # subtitle = 'These 3 plots will reveal yet-untold secrets about our beloved data-set',
+      # caption = 'Disclaimer: None of these plots are insightful'
+      , theme = my_theme()
+      ) + 
+  plot_layout(
+    guides = 'collect'
+    )
+  ggsave(pp, file = sprintf("03-results/RQ2/plots/fx-simple-effects/%s-%s-%s-%s.png", outcome, outcome_time, moder, cov), width = 8, height = 4)
+  ggsave(pp, file = sprintf("03-results/RQ2/plots/fx-simple-effects/%s-%s-%s-%s.pdf", outcome, outcome_time, moder, cov), width = 8, height = 4)
+  return(pp)
+}
+
+nested_rq2_plots <- nested_rq2_pred %>% 
+  select(-rx_pred) %>%
+  mutate(fx_pred = map(fx_pred, ~(.) %>% group_by(par) %>% nest() %>% ungroup())) %>%
+  unnest(fx_pred) %>%
+  mutate(p = pmap(list(data, par, outcome, moder, cov), rq2_fx_pred_plot_fun)) %>%
+  select(-data) %>%
+  left_join(
+    nested_rq2 %>%
+      select(-rx) %>%
+      unnest(fx) %>%
+      filter( # keep key terms
+        (moder == "none" & grepl("lonely_wpc", term)) |
+        (moder != "none" & (grepl("lonely_wpc:mod_value_c", term) | grepl("mod_value_c:", term))) 
+        ) %>%
+      filter(!grepl("sd_", term)) %>%
+      mutate(sig = ifelse(sign(lower) == sign(upper), "sig", "ns")
+             , par = ifelse(grepl("sigma", term), "Scale", "Location")) %>%
+      select(outcome:cov, sig, par) 
+  ) %>%
+  group_by(outcome, outcome_time, moder, cov) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(p2 = pmap(list(data, outcome, outcome_time, moder, cov), comb_plot))
+
+nested_rq2_plots$p2[[2]]
+
+
+comb_plot <- function(p, focal, cov){
+  np <- nrow(p)
+  nr <- if(np > 2) 2 else 1
+  nc <- if (np > 1) 2 else 1
+  pp <- wrap_plots(p$p, nrow = nr) 
+  ggsave(pp, file = sprintf("03-results/RQ2/plots/fx-simple-effects/sig/%s-%s.png", focal, cov), width = nc*5, height = nr*5)
+  ggsave(pp, file = sprintf("03-results/RQ2/plots/fx-simple-effects/sig/%s-%s.pdf", focal, cov), width = nc*5, height = nr*5)
+}
+
+edit_plot <- function(p, par, outcome, outtime, moder){
+  out <- mapvalues(outcome, var_labs$var, var_labs$label, warn_missing = F)
+  ott <- mapvalues(outtime, c("contemp", "prosp"), c("Concurrent", "Prospective"), warn_missing = F)
+  mod <- mapvalues(moder, var_labs$var, var_labs$label, warn_missing = F)
+  p + 
+    labs(
+      title = sprintf("%s %s:\n %s", ott, out, mod)
+      , subtitle = par
+    )
+}
+
+nested_rq2_sig <- nested_rq2_plots %>%
+  select(-p2) %>%
+  unnest(data) %>% 
+  filter(sig == "sig") %>%
+  filter(outcome != "dsm_score") %>%
+  mutate(
+    focal = ifelse(grepl("cog_", outcome), "focal", "sup")
+    , rq = factor(moder, c("none", "loneliness_gmc", "ss_qual_wpc", "ss_quant_wpc", "age_c")
+                  , c("RQ2a", "RQ2b", "RQ2d", "RQ2c", "Sensitivity"))
+    , outcome = factor(outcome, var_labs$var, var_labs$label)
+    ) %>%
+  arrange(focal, outcome_time, rq) %>%
+  mutate(p = pmap(list(p, par, outcome, outcome_time, moder), edit_plot)) %>%
+  group_by(focal, cov) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(p = pmap(list(data, focal, cov), comb_plot))
+```
